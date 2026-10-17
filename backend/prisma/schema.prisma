@@ -1,0 +1,129 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CANDIDATE
+  ADMIN
+}
+
+// 1 form filling, 2 shortlisted, 3 slot choosing, 4 interview, 5 selected
+enum Stage {
+  FORM_FILLING
+  SHORTLISTED
+  SLOT_CHOOSING
+  INTERVIEW
+  SELECTED
+  REJECTED
+}
+
+model User {
+  id                 String        @id @default(auto()) @map("_id") @db.ObjectId
+  name               String
+  email              String        @unique
+  phone              String
+  regNumber          String        @unique
+  image              String?
+  role               Role          @default(CANDIDATE)
+  preferredDomainIds String[]      @db.ObjectId
+  stage              Stage         @default(FORM_FILLING)
+  formSubmittedAt    DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  answers            Answer[]
+  bookings           SlotBooking[]
+}
+
+model Domain {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  slug        String       @unique
+  description String?
+  isActive    Boolean      @default(true)
+  subsections Subsection[]
+  questions   Question[]
+  slots       Slot[]
+}
+
+model Subsection {
+  id        String     @id @default(auto()) @map("_id") @db.ObjectId
+  domainId  String     @db.ObjectId
+  domain    Domain     @relation(fields: [domainId], references: [id])
+  name      String
+  order     Int        @default(0)
+  questions Question[]
+  slots     Slot[]
+
+  @@index([domainId])
+}
+
+model Question {
+  id           String      @id @default(auto()) @map("_id") @db.ObjectId
+  domainId     String      @db.ObjectId
+  domain       Domain      @relation(fields: [domainId], references: [id])
+  subsectionId String?     @db.ObjectId
+  subsection   Subsection? @relation(fields: [subsectionId], references: [id])
+  text         String
+  order        Int         @default(0)
+  required     Boolean     @default(true)
+  maxLength    Int         @default(2000)
+  answers      Answer[]
+
+  @@index([domainId])
+}
+
+model Answer {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @db.ObjectId
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questionId String   @db.ObjectId
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  text       String
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, questionId])
+}
+
+// One document (key = "main") with the global settings
+model RecruitmentConfig {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  key          String   @unique @default("main")
+  isOpen       Boolean  @default(true)
+  formDeadline DateTime
+  updatedAt    DateTime @updatedAt
+}
+
+model Slot {
+  id           String        @id @default(auto()) @map("_id") @db.ObjectId
+  domainId     String        @db.ObjectId
+  domain       Domain        @relation(fields: [domainId], references: [id])
+  subsectionId String        @db.ObjectId
+  subsection   Subsection    @relation(fields: [subsectionId], references: [id])
+  startTime    DateTime
+  endTime      DateTime
+  capacity     Int           @default(1)
+  bookedCount  Int           @default(0)
+  bookings     SlotBooking[]
+
+  @@index([domainId, startTime])
+}
+
+model SlotBooking {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String   @db.ObjectId
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  slotId       String   @db.ObjectId
+  slot         Slot     @relation(fields: [slotId], references: [id], onDelete: Cascade)
+  domainId     String   @db.ObjectId
+  subsectionId String   @db.ObjectId
+  createdAt    DateTime @default(now())
+
+  // one interview booking per candidate per domain
+  @@unique([userId, domainId])
+  @@index([slotId])
+}
