@@ -16,7 +16,6 @@ function isAllowedEmail(email: string) {
 }
 
 // POST /api/auth/google   body: { idToken }
-// The frontend sends the Google token; we check it and give back our own login token.
 router.post(
   "/google",
   asyncHandler(async (req, res) => {

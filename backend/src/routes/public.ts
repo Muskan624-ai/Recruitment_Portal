@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../prisma";
 import { asyncHandler } from "../middleware/error";
 import { getConfig } from "../utils/recruitment";
+import { ALL_DOMAINS, DOMAIN_LABELS } from "../utils/domains";
 
 const router = Router();
 
@@ -9,17 +10,12 @@ const router = Router();
 router.get(
   "/domains",
   asyncHandler(async (_req, res) => {
-    const domains = await prisma.domain.findMany({
-      where: { isActive: true },
-      orderBy: { name: "asc" },
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        description: true,
-        subsections: { orderBy: { order: "asc" }, select: { id: true, name: true } },
-      },
-    });
+    const subsections = await prisma.subsection.findMany({ orderBy: { order: "asc" } });
+    const domains = ALL_DOMAINS.map((d) => ({
+      domain: d,
+      label: DOMAIN_LABELS[d],
+      subsections: subsections.filter((s) => s.domain === d).map((s) => ({ id: s.id, name: s.name })),
+    }));
     res.json({ domains });
   })
 );
