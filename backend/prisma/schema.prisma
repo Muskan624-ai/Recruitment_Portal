@@ -7,9 +7,18 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum DomainType {
+  TECHNICAL
+  MANAGEMENT
+  DESIGN
+  MARKETING
+  R_AND_D
+  EDITORIAL
+}
+
 enum Role {
-  CANDIDATE
-  ADMIN
+  DOMAIN_HEAD
+  ROOT_ADMIN
 }
 
 // 1 form filling, 2 shortlisted, 3 slot choosing, 4 interview, 5 selected
@@ -22,50 +31,79 @@ enum Stage {
   REJECTED
 }
 
-model User {
-  id                 String        @id @default(auto()) @map("_id") @db.ObjectId
-  name               String
-  email              String        @unique
-  phone              String
-  regNumber          String        @unique
-  image              String?
-  role               Role          @default(CANDIDATE)
-  preferredDomainIds String[]      @db.ObjectId
-  stage              Stage         @default(FORM_FILLING)
-  formSubmittedAt    DateTime?
-  createdAt          DateTime      @default(now())
-  updatedAt          DateTime      @updatedAt
-  answers            Answer[]
-  bookings           SlotBooking[]
+enum EmailType {
+  SHORTLISTED
+  MEETING_LINK
+  SELECTED
+  REJECTED
+  GENERAL
 }
 
-model Domain {
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Admin {
+  id           String      @id @default(auto()) @map("_id") @db.ObjectId
+  name         String?
+  email        String      @unique
+  role         Role        @default(DOMAIN_HEAD)
+  domain       DomainType?
+  slotsCreated Slot[]      @relation("AdminSlots")
+}
+
+model User {
+  id           String        @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  email        String        @unique
+  phone        String
+  regNumber    String        @unique
+  image        String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  answers      Answer[]
+  applications Application[]
+}
+
+// One row per candidate per domain
+model Application {
   id          String       @id @default(auto()) @map("_id") @db.ObjectId
-  name        String
-  slug        String       @unique
-  description String?
-  isActive    Boolean      @default(true)
-  subsections Subsection[]
-  questions   Question[]
-  slots       Slot[]
+  domain      DomainType
+  stage       Stage        @default(FORM_FILLING)
+  submittedAt DateTime?
+  createdAt   DateTime     @default(now())
+
+  review1Marks    Int?
+  review1Comments String?
+  review1Passed   Boolean @default(false)
+  review2Marks    Int?
+  review2Comments String?
+  review2Passed   Boolean @default(false)
+
+  userId  String       @db.ObjectId
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  booking SlotBooking?
+  emails  EmailLog[]
+
+  @@unique([userId, domain])
+  @@index([domain, stage])
 }
 
 model Subsection {
   id        String     @id @default(auto()) @map("_id") @db.ObjectId
-  domainId  String     @db.ObjectId
-  domain    Domain     @relation(fields: [domainId], references: [id])
+  domain    DomainType
   name      String
   order     Int        @default(0)
   questions Question[]
-  slots     Slot[]
 
-  @@index([domainId])
+  @@index([domain])
 }
 
 model Question {
   id           String      @id @default(auto()) @map("_id") @db.ObjectId
-  domainId     String      @db.ObjectId
-  domain       Domain      @relation(fields: [domainId], references: [id])
+  domain       DomainType
   subsectionId String?     @db.ObjectId
   subsection   Subsection? @relation(fields: [subsectionId], references: [id])
   text         String
@@ -74,56 +112,65 @@ model Question {
   maxLength    Int         @default(2000)
   answers      Answer[]
 
-  @@index([domainId])
+  @@index([domain])
 }
 
 model Answer {
   id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  text       String
   userId     String   @db.ObjectId
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   questionId String   @db.ObjectId
   question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  text       String
   updatedAt  DateTime @updatedAt
 
   @@unique([userId, questionId])
 }
 
-// One document (key = "main") with the global settings
+model Slot {
+  id            String        @id @default(auto()) @map("_id") @db.ObjectId
+  domain        DomainType
+  startTime     DateTime
+  endTime       DateTime
+  meetingLink   String?
+  capacity      Int           @default(1)
+  bookedCount   Int           @default(0)
+  interviewerId String        @db.ObjectId
+  interviewer   Admin         @relation("AdminSlots", fields: [interviewerId], references: [id])
+  bookings      SlotBooking[]
+
+  @@index([domain, startTime])
+}
+
+model SlotBooking {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  applicationId String      @unique @db.ObjectId
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  slotId        String      @db.ObjectId
+  slot          Slot        @relation(fields: [slotId], references: [id], onDelete: Restrict)
+  createdAt     DateTime    @default(now())
+
+  @@index([slotId])
+}
+
+model EmailLog {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  applicationId String      @db.ObjectId
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  type          EmailType
+  status        EmailStatus @default(PENDING)
+  attempts      Int         @default(0)
+  error         String?
+  sentAt        DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([applicationId, type])
+}
+
 model RecruitmentConfig {
   id           String   @id @default(auto()) @map("_id") @db.ObjectId
   key          String   @unique @default("main")
   isOpen       Boolean  @default(true)
   formDeadline DateTime
   updatedAt    DateTime @updatedAt
-}
-
-model Slot {
-  id           String        @id @default(auto()) @map("_id") @db.ObjectId
-  domainId     String        @db.ObjectId
-  domain       Domain        @relation(fields: [domainId], references: [id])
-  subsectionId String        @db.ObjectId
-  subsection   Subsection    @relation(fields: [subsectionId], references: [id])
-  startTime    DateTime
-  endTime      DateTime
-  capacity     Int           @default(1)
-  bookedCount  Int           @default(0)
-  bookings     SlotBooking[]
-
-  @@index([domainId, startTime])
-}
-
-model SlotBooking {
-  id           String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId       String   @db.ObjectId
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  slotId       String   @db.ObjectId
-  slot         Slot     @relation(fields: [slotId], references: [id], onDelete: Cascade)
-  domainId     String   @db.ObjectId
-  subsectionId String   @db.ObjectId
-  createdAt    DateTime @default(now())
-
-  // one interview booking per candidate per domain
-  @@unique([userId, domainId])
-  @@index([slotId])
 }

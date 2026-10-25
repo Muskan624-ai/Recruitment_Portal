@@ -3,66 +3,72 @@ import { prisma } from "../prisma";
 import { HttpError } from "../errors";
 import { asyncHandler } from "../middleware/error";
 import { requireUser } from "../middleware/auth";
-import { saveAnswerSchema } from "../utils/validators";
-import { assertFormEditable, formState, getConfig } from "../utils/recruitment";
+import { saveAnswerSchema, submitFormSchema } from "../utils/validators";
+import { applicationState, assertEditable, getApplication, getConfig } from "../utils/recruitment";
+import { DOMAIN_LABELS } from "../utils/domains";
 
 const router = Router();
 router.use(...requireUser);
 
-// GET /api/form -> questions for the chosen domains + saved answers + deadline + lock state
+// GET /api/form -> every domain the candidate applied to, with questions and saved answers
 router.get(
   "/",
   asyncHandler(async (req, res) => {
     const user = req.user!;
     const config = await getConfig();
 
-    const [domains, answers] = await Promise.all([
-      prisma.domain.findMany({
-        where: { id: { in: user.preferredDomainIds }, isActive: true },
-        orderBy: { name: "asc" },
-        include: {
-          subsections: { orderBy: { order: "asc" } },
-          questions: { orderBy: { order: "asc" } },
-        },
-      }),
+    const applications = await prisma.application.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "asc" },
+    });
+    const domains = applications.map((a) => a.domain);
+
+    const [subsections, questions, answers] = await Promise.all([
+      prisma.subsection.findMany({ where: { domain: { in: domains } }, orderBy: { order: "asc" } }),
+      prisma.question.findMany({ where: { domain: { in: domains } }, orderBy: { order: "asc" } }),
       prisma.answer.findMany({ where: { userId: user.id } }),
     ]);
-
     const byQuestion = new Map(answers.map((a) => [a.questionId, a]));
-    let requiredTotal = 0;
-    let requiredAnswered = 0;
-
-    const payload = domains.map((d) => ({
-      id: d.id,
-      name: d.name,
-      subsections: d.subsections.map((s) => ({ id: s.id, name: s.name })),
-      questions: d.questions.map((q) => {
-        const a = byQuestion.get(q.id);
-        if (q.required) {
-          requiredTotal++;
-          if (a && a.text.trim()) requiredAnswered++;
-        }
-        return {
-          id: q.id,
-          subsectionId: q.subsectionId,
-          text: q.text,
-          required: q.required,
-          maxLength: q.maxLength,
-          answer: a?.text ?? "",
-          savedAt: a?.updatedAt ?? null,
-        };
-      }),
-    }));
-
     const now = Date.now();
+
     res.json({
-      ...formState(config, user),
       isOpen: config.isOpen,
       formDeadline: config.formDeadline,
       serverTime: new Date(now).toISOString(),
       msRemaining: Math.max(0, config.formDeadline.getTime() - now),
-      progress: { requiredAnswered, requiredTotal },
-      domains: payload,
+      applications: applications.map((app) => {
+        let requiredTotal = 0;
+        let requiredAnswered = 0;
+        const items = questions
+          .filter((q) => q.domain === app.domain)
+          .map((q) => {
+            const a = byQuestion.get(q.id);
+            if (q.required) {
+              requiredTotal++;
+              if (a && a.text.trim()) requiredAnswered++;
+            }
+            return {
+              id: q.id,
+              subsectionId: q.subsectionId,
+              text: q.text,
+              required: q.required,
+              maxLength: q.maxLength,
+              answer: a?.text ?? "",
+              savedAt: a?.updatedAt ?? null,
+            };
+          });
+        return {
+          domain: app.domain,
+          label: DOMAIN_LABELS[app.domain],
+          stage: app.stage,
+          ...applicationState(config, app),
+          progress: { requiredAnswered, requiredTotal },
+          subsections: subsections
+            .filter((s) => s.domain === app.domain)
+            .map((s) => ({ id: s.id, name: s.name })),
+          questions: items,
+        };
+      }),
     });
   })
 );
@@ -73,14 +79,14 @@ router.put(
   asyncHandler(async (req, res) => {
     const user = req.user!;
     const config = await getConfig();
-    assertFormEditable(config, user);
-
     const { questionId, text } = saveAnswerSchema.parse(req.body);
 
     const question = await prisma.question.findUnique({ where: { id: questionId } });
-    if (!question || !user.preferredDomainIds.includes(question.domainId)) {
-      throw new HttpError(404, "Question not found", "QUESTION_NOT_FOUND");
-    }
+    if (!question) throw new HttpError(404, "Question not found", "QUESTION_NOT_FOUND");
+
+    const app = await getApplication(user.id, question.domain);
+    assertEditable(config, app);
+
     if (text.length > question.maxLength) {
       throw new HttpError(400, `Answer exceeds ${question.maxLength} characters`, "ANSWER_TOO_LONG");
     }
@@ -94,22 +100,24 @@ router.put(
   })
 );
 
-// POST /api/form/submit -> final submit at the bottom of the form
+// POST /api/form/submit   body: { domain } -> final submit for one domain
 router.post(
   "/submit",
   asyncHandler(async (req, res) => {
     const user = req.user!;
     const config = await getConfig();
-    assertFormEditable(config, user);
+    const { domain } = submitFormSchema.parse(req.body);
+
+    const app = await getApplication(user.id, domain);
+    assertEditable(config, app);
 
     const [required, answers] = await Promise.all([
       prisma.question.findMany({
-        where: { domainId: { in: user.preferredDomainIds }, required: true },
+        where: { domain, required: true },
         select: { id: true, text: true },
       }),
       prisma.answer.findMany({ where: { userId: user.id } }),
     ]);
-
     const answered = new Set(answers.filter((a) => a.text.trim()).map((a) => a.questionId));
     const missing = required.filter((q) => !answered.has(q.id));
     if (missing.length) {
@@ -117,14 +125,13 @@ router.post(
     }
 
     // protects against double submits
-    const result = await prisma.user.updateMany({
-      where: { id: user.id, formSubmittedAt: null },
-      data: { formSubmittedAt: new Date() },
+    const result = await prisma.application.updateMany({
+      where: { id: app.id, submittedAt: null },
+      data: { submittedAt: new Date() },
     });
-    if (result.count === 0) {
-      throw new HttpError(409, "Form already submitted", "ALREADY_SUBMITTED");
-    }
-    res.json({ submitted: true });
+    if (result.count === 0) throw new HttpError(409, "Form already submitted", "ALREADY_SUBMITTED");
+
+    res.json({ submitted: true, domain });
   })
 );
 

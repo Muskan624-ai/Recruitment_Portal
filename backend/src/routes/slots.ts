@@ -5,13 +5,8 @@ import { prisma } from "../prisma";
 import { HttpError } from "../errors";
 import { asyncHandler } from "../middleware/error";
 import { requireUser } from "../middleware/auth";
-import {
-  bookSlotSchema,
-  calendarQuerySchema,
-  objectId,
-  slotsQuerySchema,
-} from "../utils/validators";
-import { assertSlotAccess } from "../utils/recruitment";
+import { bookSlotSchema, calendarQuerySchema, objectId, slotsQuerySchema } from "../utils/validators";
+import { assertSlotAccess, getApplication } from "../utils/recruitment";
 import { istDateKey, istDayRange, istMonthRange } from "../utils/time";
 
 const router = Router();
@@ -22,23 +17,18 @@ const CANCEL_CUTOFF_MS = 12 * 60 * 60 * 1000; // no cancelling within 12h of the
 
 class RetryError extends Error {}
 
-// GET /api/slots/calendar?domainId=&subsectionId=&month=2026-11 -> availability per date
+// GET /api/slots/calendar?domain=TECHNICAL&month=2026-11 -> availability per date
 router.get(
   "/calendar",
   asyncHandler(async (req, res) => {
-    const user = req.user!;
     const q = calendarQuerySchema.parse(req.query);
-    assertSlotAccess(user, q.domainId);
+    assertSlotAccess(await getApplication(req.user!.id, q.domain));
 
     const [from, to] = istMonthRange(q.month);
     const now = new Date();
 
     const slots = await prisma.slot.findMany({
-      where: {
-        domainId: q.domainId,
-        ...(q.subsectionId ? { subsectionId: q.subsectionId } : {}),
-        startTime: { gte: from > now ? from : now, lt: to },
-      },
+      where: { domain: q.domain, startTime: { gte: from > now ? from : now, lt: to } },
       select: { startTime: true, capacity: true, bookedCount: true },
       orderBy: { startTime: "asc" },
     });
@@ -55,53 +45,44 @@ router.get(
   })
 );
 
-// GET /api/slots?domainId=&subsectionId=&date=2026-11-03 -> slots for the clicked date
+// GET /api/slots?domain=TECHNICAL&date=2026-11-03 -> slots for the clicked date
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const user = req.user!;
     const q = slotsQuerySchema.parse(req.query);
-    assertSlotAccess(user, q.domainId);
+    const app = await getApplication(req.user!.id, q.domain);
+    assertSlotAccess(app);
 
     const [from, to] = istDayRange(q.date);
     const now = new Date();
 
     const slots = await prisma.slot.findMany({
-      where: {
-        domainId: q.domainId,
-        ...(q.subsectionId ? { subsectionId: q.subsectionId } : {}),
-        startTime: { gte: from > now ? from : now, lt: to },
-      },
+      where: { domain: q.domain, startTime: { gte: from > now ? from : now, lt: to } },
       orderBy: { startTime: "asc" },
     });
+    const mine = await prisma.slotBooking.findUnique({ where: { applicationId: app.id } });
 
-    const mine = await prisma.slotBooking.findMany({
-      where: { userId: user.id, slotId: { in: slots.map((s) => s.id) } },
-      select: { slotId: true },
-    });
-    const mineSet = new Set(mine.map((m) => m.slotId));
-
+    // meetingLink is NOT returned here: only people who booked the slot see it
     res.json({
       date: q.date,
       slots: slots.map((s) => ({
         id: s.id,
-        subsectionId: s.subsectionId,
         startTime: s.startTime,
         endTime: s.endTime,
         remaining: Math.max(0, s.capacity - s.bookedCount),
-        bookedByMe: mineSet.has(s.id),
+        bookedByMe: mine?.slotId === s.id,
       })),
     });
   })
 );
 
-// GET /api/slots/book -> my bookings
+// GET /api/slots/book -> my bookings (with the meeting link)
 router.get(
   "/book",
   asyncHandler(async (req, res) => {
     const bookings = await prisma.slotBooking.findMany({
-      where: { userId: req.user!.id },
-      include: { slot: { select: { startTime: true, endTime: true } } },
+      where: { application: { userId: req.user!.id } },
+      include: { slot: { select: { domain: true, startTime: true, endTime: true, meetingLink: true } } },
       orderBy: { createdAt: "asc" },
     });
     res.json({ bookings });
@@ -117,12 +98,11 @@ router.post(
 
     const first = await prisma.slot.findUnique({ where: { id: slotId } });
     if (!first) throw new HttpError(404, "Slot not found", "SLOT_NOT_FOUND");
-    assertSlotAccess(user, first.domainId);
 
-    const existing = await prisma.slotBooking.findUnique({
-      where: { userId_domainId: { userId: user.id, domainId: first.domainId } },
-    });
-    if (existing) {
+    const app = await getApplication(user.id, first.domain);
+    assertSlotAccess(app);
+
+    if (await prisma.slotBooking.findUnique({ where: { applicationId: app.id } })) {
       throw new HttpError(
         409,
         "You already booked a slot for this domain. Cancel it to pick another.",
@@ -133,12 +113,8 @@ router.post(
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const slot = await prisma.slot.findUnique({ where: { id: slotId } });
       if (!slot) throw new HttpError(404, "Slot not found", "SLOT_NOT_FOUND");
-      if (slot.startTime <= new Date()) {
-        throw new HttpError(409, "This slot has already started", "SLOT_PAST");
-      }
-      if (slot.bookedCount >= slot.capacity) {
-        throw new HttpError(409, "This slot is full", "SLOT_FULL");
-      }
+      if (slot.startTime <= new Date()) throw new HttpError(409, "This slot has already started", "SLOT_PAST");
+      if (slot.bookedCount >= slot.capacity) throw new HttpError(409, "This slot is full", "SLOT_FULL");
 
       try {
         const booking = await prisma.$transaction(async (tx) => {
@@ -150,21 +126,16 @@ router.post(
           if (updated.count === 0) throw new RetryError();
 
           const created = await tx.slotBooking.create({
-            data: {
-              userId: user.id,
-              slotId: slot.id,
-              domainId: slot.domainId,
-              subsectionId: slot.subsectionId,
-            },
+            data: { applicationId: app.id, slotId: slot.id },
           });
           // stage 3 (slot choosing) -> stage 4 (interview)
-          await tx.user.updateMany({
-            where: { id: user.id, stage: { in: ["SHORTLISTED", "SLOT_CHOOSING"] } },
+          await tx.application.updateMany({
+            where: { id: app.id, stage: { in: ["SHORTLISTED", "SLOT_CHOOSING"] } },
             data: { stage: "INTERVIEW" },
           });
           return created;
         });
-        res.status(201).json({ booking });
+        res.status(201).json({ booking, meetingLink: slot.meetingLink });
         return;
       } catch (e) {
         const writeConflict = e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2034";
@@ -185,9 +156,9 @@ router.delete(
 
     const booking = await prisma.slotBooking.findUnique({
       where: { id: bookingId },
-      include: { slot: true },
+      include: { slot: true, application: true },
     });
-    if (!booking || booking.userId !== user.id) {
+    if (!booking || booking.application.userId !== user.id) {
       throw new HttpError(404, "Booking not found", "BOOKING_NOT_FOUND");
     }
     if (booking.slot.startTime.getTime() - Date.now() < CANCEL_CUTOFF_MS) {
@@ -200,13 +171,10 @@ router.delete(
         where: { id: booking.slotId, bookedCount: { gt: 0 } },
         data: { bookedCount: { decrement: 1 } },
       });
-      const remaining = await tx.slotBooking.count({ where: { userId: user.id } });
-      if (remaining === 0) {
-        await tx.user.updateMany({
-          where: { id: user.id, stage: "INTERVIEW" },
-          data: { stage: "SLOT_CHOOSING" },
-        });
-      }
+      await tx.application.updateMany({
+        where: { id: booking.applicationId, stage: "INTERVIEW" },
+        data: { stage: "SLOT_CHOOSING" },
+      });
     });
     res.json({ cancelled: true });
   })

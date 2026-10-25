@@ -3,12 +3,13 @@ import cors from "cors";
 import helmet from "helmet";
 import { config } from "./config";
 import { errorHandler, notFound } from "./middleware/error";
-import authRouter from "./routes/auth";
 import publicRouter from "./routes/public";
 import meRouter from "./routes/me";
 import formRouter from "./routes/form";
 import statusRouter from "./routes/status";
 import slotsRouter from "./routes/slots";
+import authRouter from "./routes/auth";
+import otpAuthRouter from "./routes/otpAuth";
 
 export const app = express();
 
@@ -21,6 +22,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/api/auth", authRouter);
+app.use("/api/auth", otpAuthRouter);
 app.use("/api", publicRouter);
 app.use("/api", meRouter);
 app.use("/api/form", formRouter);
