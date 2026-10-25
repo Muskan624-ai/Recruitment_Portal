@@ -9,7 +9,7 @@ import formRouter from "./routes/form";
 import statusRouter from "./routes/status";
 import slotsRouter from "./routes/slots";
 import authRouter from "./routes/auth";
-import passwordAuthRouter from "./routes/passwordAuth";
+import otpAuthRouter from "./routes/otpAuth";
 
 export const app = express();
 
@@ -22,7 +22,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/api/auth", authRouter);
-app.use("/api/auth", passwordAuthRouter);
+app.use("/api/auth", otpAuthRouter);
 app.use("/api", publicRouter);
 app.use("/api", meRouter);
 app.use("/api/form", formRouter);
